@@ -134,7 +134,6 @@ except ImportError:
 # by relying on absolute sensor readings.
 #
 
-
 @dataclass
 class ProbeEddyParams:
     # The speed at which to perform normal homing operations
@@ -423,6 +422,12 @@ class ProbeEddyProbeResult:
 
 @final
 class ProbeEddy:
+    # Required height ranges for different operations (in mm)
+    TAP_REQ_MIN: ClassVar[float] = 0.025  # Minimum height required for tap operations
+    TAP_REQ_MAX: ClassVar[float] = 3.0    # Maximum height required for tap operations
+    HOMING_REQ_MIN: ClassVar[float] = 0.5  # Minimum height required for homing operations
+    HOMING_REQ_MAX: ClassVar[float] = 5.0  # Maximum height required for homing operations
+
     def __init__(self, config: ConfigWrapper):
         logging.info("Hello from ProbeEddyNG")
 
@@ -450,18 +455,19 @@ class ProbeEddy:
         self.params = ProbeEddyParams()
         self.params.load_from_config(config)
 
-        # figure out if either of these comes from the autosave section
+        # figure out if reg_drive_current comes from the autosave section
         # so we can sort out what we want to write out later on
         asfc = self._printer.lookup_object("configfile").autosave.fileconfig
         self._saved_reg_drive_current = asfc.getint(self._full_name, "reg_drive_current", fallback=None)
-        self._saved_tap_drive_current = asfc.getint(self._full_name, "tap_drive_current", fallback=None)
 
-        # in case there's legacy drive currents
+        # in case there's legacy drive current
         old_saved_reg_drive_current = asfc.getint(self._full_name, "saved_reg_drive_current", fallback=0)
-        old_saved_tap_drive_current = asfc.getint(self._full_name, "saved_tap_drive_current", fallback=0)
 
         self._reg_drive_current = self.params.reg_drive_current or old_saved_reg_drive_current or self._sensor._drive_current
-        self._tap_drive_current = self.params.tap_drive_current or old_saved_tap_drive_current or self._reg_drive_current
+        
+        # tap_drive_current is always found dynamically during PROBE_EDDY_NG_TAP
+        # Never saved or loaded from config - always None until TAP is called
+        self._tap_drive_current = self.params.tap_drive_current if self.params.tap_drive_current else None
 
         # at what minimum physical height to start homing. It must be above the safe start position,
         # because we need to move from the start through the safe start position
@@ -682,8 +688,15 @@ class ProbeEddy:
 
     def reset_drive_current(self, tap=False):
         dc = self._tap_drive_current if tap else self._reg_drive_current
-        if dc == 0:
-            raise self._printer.command_error(f"Unknown {'tap' if tap else 'homing'} drive current")
+        if dc is None or dc == 0:
+            if tap:
+                # tap_drive_current will be found dynamically during PROBE_EDDY_NG_TAP
+                # For now, just use reg_drive_current as a fallback
+                dc = self._reg_drive_current
+                if dc is None or dc == 0:
+                    raise self._printer.command_error("Unknown tap drive current. Run PROBE_EDDY_NG_TAP to find it automatically.")
+            else:
+                raise self._printer.command_error(f"Unknown {'tap' if tap else 'homing'} drive current")
         self._sensor.set_drive_current(dc)
 
     def map_for_drive_current(self, dc: Optional[int] = None) -> ProbeEddyFrequencyMap:
@@ -763,11 +776,6 @@ class ProbeEddy:
 
         configfile.set(
             self._full_name,
-            "calibrated_drive_currents",
-            str.join(", ", [str(dc) for dc in self._dc_to_fmap.keys()]),
-        )
-        configfile.set(
-            self._full_name,
             "calibration_version",
             str(ProbeEddyFrequencyMap.calibration_version),
         )
@@ -775,11 +783,16 @@ class ProbeEddy:
         if self.params.reg_drive_current != self._reg_drive_current or self.params.reg_drive_current == self._saved_reg_drive_current:
             configfile.set(self._full_name, "reg_drive_current", str(self._reg_drive_current))
 
-        if self.params.tap_drive_current != self._tap_drive_current or self.params.tap_drive_current == self._saved_tap_drive_current:
-            configfile.set(self._full_name, "tap_drive_current", str(self._tap_drive_current))
-
-        for _, fmap in self._dc_to_fmap.items():
-            fmap.save_calibration()
+        # Only save calibration for reg_drive_current
+        # Tap drive current calibration is always dynamic and never saved
+        if self._reg_drive_current and self._reg_drive_current in self._dc_to_fmap:
+            self._dc_to_fmap[self._reg_drive_current].save_calibration()
+            # Only include reg_drive_current in calibrated_drive_currents
+            configfile.set(
+                self._full_name,
+                "calibrated_drive_currents",
+                str(self._reg_drive_current),
+            )
 
         self._log_msg("Calibration saved. Issue a SAVE_CONFIG to write the values to your config file and restart Klipper.")
 
@@ -1137,12 +1150,10 @@ class ProbeEddy:
         )
 
         # This is going to automate setup.
-        # The setup state machine looks like this:
-        # 1. Finding homing drive current
-        # 2. Finding tapping drive current
+        # The setup only finds and calibrates the homing drive current.
+        # Tap drive current will be found and calibrated dynamically during PROBE_EDDY_NG_TAP.
         FINDING_HOMING = 1
-        FINDING_TAP = 2
-        DONE = 3
+        DONE = 2
 
         start_drive_current = drive_current
         result_msg = None
@@ -1160,54 +1171,33 @@ class ProbeEddy:
                 write_debug_files=debug,
             )
 
-            homing_req_min = 0.5
-            homing_req_max = 5.0
-            tap_req_min = 0.025
-            tap_req_max = 3.0
-
             ok_for_homing = mapping is not None
-            ok_for_tap = mapping is not None
 
-            if ok_for_homing and (mapping.height_range[0] > homing_req_min or mapping.height_range[1] < homing_req_max):
+            if ok_for_homing and (mapping.height_range[0] > ProbeEddy.HOMING_REQ_MIN or mapping.height_range[1] < ProbeEddy.HOMING_REQ_MAX):
                 ok_for_homing = False
-            if ok_for_tap and (mapping.height_range[0] > tap_req_min or mapping.height_range[1] < tap_req_max):
-                ok_for_tap = False
 
-            if ok_for_homing or ok_for_tap:
-                self._log_info(f"dc {drive_current} homing {ok_for_homing} tap {ok_for_tap}, {fth_rms} {htf_rms}")
+            if ok_for_homing:
+                self._log_info(f"dc {drive_current} homing {ok_for_homing}, {fth_rms} {htf_rms}")
                 if mapping.freq_spread() < 0.30:
                     self._log_warning(
                         f"frequency spread {mapping.freq_spread()} is very low at drive current {drive_current}. (The sensor is probably mounted too high; the height includes any case thickness.)"
                     )
-                    ok_for_homing = ok_for_tap = False
+                    ok_for_homing = False
                 if fth_rms is None or fth_rms > 0.025:
                     self._log_msg(f"calibration error rate is too high ({fth_rms}) at drive current {drive_current}.")
-                    ok_for_homing = ok_for_tap = False
+                    ok_for_homing = False
 
             if state == FINDING_HOMING and ok_for_homing:
                 self._dc_to_fmap[drive_current] = mapping
                 self._reg_drive_current = drive_current
                 self._log_msg(f"using {drive_current} for homing.")
-                state = FINDING_TAP
-
-            if state == FINDING_TAP and ok_for_tap:
-                self._dc_to_fmap[drive_current] = mapping
-                self._tap_drive_current = drive_current
-                self._log_msg(f"using {drive_current} for tap.")
                 state = DONE
-
-            if state == DONE:
-                result_msg = "Setup success. Please check whether homing works with G28 Z, then check if tap works with PROBE_EDDY_NG_TAP."
+                result_msg = "Setup success. Homing drive current calibrated. Tap drive current will be calibrated automatically during PROBE_EDDY_NG_TAP."
                 break
 
             if drive_current - start_drive_current >= max_dc_increase:
                 # we've failed completely
-                if state == FINDING_HOMING:
-                    result_msg = "Failed to find homing drive current. (Have you checked the sensor height?)"
-                elif state == FINDING_TAP:
-                    result_msg = "Failed to find tap drive current, but homing is set up. (Have you checked the sensor height?)"
-                else:
-                    result_msg = "Unknown state?"
+                result_msg = "Failed to find homing drive current. (Have you checked the sensor height?)"
                 break
 
             # increase DC and keep going
@@ -1218,7 +1208,7 @@ class ProbeEddy:
         else:
             self._log_error(result_msg)
 
-        if state > FINDING_HOMING:
+        if state == DONE:
             self.reset_drive_current()
             self.save_config()
 
@@ -1308,6 +1298,211 @@ class ProbeEddy:
 
         # reset the Z homing state after alibration
         self._z_not_homed()
+
+    def _find_tap_drive_current(
+        self,
+        start_drive_current: int,
+        max_dc_increase: int,
+        z_start: float,
+        z_target: float,
+        probe_speed: float,
+        lift_speed: float,
+        report_errors: bool = False,
+        write_debug_files: bool = False,
+    ) -> Tuple[Optional[int], Optional[ProbeEddyFrequencyMap]]:
+        """
+        Find the optimal drive current for tap operations.
+        
+        Args:
+            start_drive_current: Starting drive current to test from
+            max_dc_increase: Maximum increase from start_drive_current to try
+            z_start: Starting Z height for calibration
+            z_target: Target Z height for calibration
+            probe_speed: Speed for probe movement
+            lift_speed: Speed for lift movement
+            report_errors: Whether to report errors during calibration
+            write_debug_files: Whether to write debug files during calibration
+            
+        Returns:
+            Tuple of (drive_current, mapping) if found, or (None, None) if not found
+        """
+        tolerance = 0.01  # Tolerance for floating point comparisons
+        
+        drive_current = start_drive_current
+        end_drive_current = start_drive_current + max_dc_increase
+        
+        self._log_msg("Finding optimal tap drive current...")
+        
+        # Track all acceptable drive currents and their characteristics
+        acceptable_dcs = []  # List of (drive_current, mapping, min_height, max_height, fth_rms, freq_spread)
+        best_max_height_seen = None  # Track to detect overshooting
+        
+        while drive_current <= end_drive_current:
+            mapping, fth_rms, htf_rms = self._create_mapping(
+                z_start,
+                z_target,
+                probe_speed,
+                lift_speed,
+                drive_current,
+                report_errors=report_errors,
+                write_debug_files=write_debug_files,
+            )
+            
+            ok_for_tap = mapping is not None
+            current_max_height = None
+            
+            if ok_for_tap:
+                current_max_height = mapping.height_range[1]
+                current_min_height = mapping.height_range[0]
+                
+                # Check if max_height is decreasing significantly - this means we're overshooting
+                # Only stop if the decrease is significant (more than tolerance)
+                if best_max_height_seen is not None and current_max_height < (best_max_height_seen - tolerance):
+                    # Max height is decreasing significantly, we've gone too far
+                    if report_errors:
+                        self._log_msg(
+                            f"dc {drive_current}: max height {current_max_height:.3f} is decreasing significantly from previous best {best_max_height_seen:.3f}. "
+                            "Stopping search - drive current is too high."
+                        )
+                    break
+                
+                # Update best_max_height_seen
+                if best_max_height_seen is None or current_max_height > best_max_height_seen:
+                    best_max_height_seen = current_max_height
+                
+                # Check height range requirements with tolerance
+                # Range covers tap range if: min <= TAP_REQ_MIN AND max >= TAP_REQ_MAX
+                covers_min = current_min_height <= (ProbeEddy.TAP_REQ_MIN + tolerance)
+                covers_max = current_max_height >= (ProbeEddy.TAP_REQ_MAX - tolerance)
+                
+                if not (covers_min and covers_max):
+                    ok_for_tap = False
+                    if report_errors:
+                        self._log_msg(
+                            f"dc {drive_current}: height range {mapping.height_range} doesn't cover tap range [{ProbeEddy.TAP_REQ_MIN}, {ProbeEddy.TAP_REQ_MAX}]"
+                        )
+                    
+                    # If we can't detect low enough (min > TAP_REQ_MIN), drive current is too low - continue
+                    if not covers_min:
+                        if report_errors:
+                            self._log_msg(f"dc {drive_current}: min height too high (min {current_min_height:.3f} > {ProbeEddy.TAP_REQ_MIN + tolerance:.3f}), drive current too low, continuing search...")
+                        drive_current += 1
+                        continue
+                    # If we can't detect high enough (max < TAP_REQ_MAX), drive current is too high - stop
+                    elif not covers_max:
+                        if report_errors:
+                            self._log_msg(f"dc {drive_current}: max height too low (max {current_max_height:.3f} < {ProbeEddy.TAP_REQ_MAX - tolerance:.3f}), drive current too high, stopping search...")
+                        break
+                
+                # Check frequency spread
+                if ok_for_tap and mapping.freq_spread() < 0.30:
+                    self._log_warning(
+                        f"dc {drive_current}: frequency spread {mapping.freq_spread()} is very low. (The sensor is probably mounted too high; the height includes any case thickness.)"
+                    )
+                    ok_for_tap = False
+                
+                # Check calibration error
+                if ok_for_tap and (fth_rms is None or fth_rms > 0.025):
+                    if report_errors:
+                        self._log_msg(f"dc {drive_current}: calibration error rate is too high ({fth_rms})")
+                    ok_for_tap = False
+                
+                if ok_for_tap:
+                    # Check min_height warning (same logic as original version)
+                    min_height = mapping.height_range[0]
+                    if min_height > ProbeEddy.TAP_REQ_MIN:
+                        self._log_msg(
+                            f"Drive current {drive_current} warning: min height is {min_height:.3f} (> {ProbeEddy.TAP_REQ_MIN}) is too high for tap. This calibration will work fine for homing, but may not for tap."
+                        )
+                    
+                    # Add to acceptable list instead of returning immediately
+                    acceptable_dcs.append((drive_current, mapping, current_min_height, current_max_height, fth_rms, mapping.freq_spread()))
+                    if report_errors:
+                        self._log_msg(f"dc {drive_current}: acceptable (freq spread: {mapping.freq_spread():.2f}%, error: {fth_rms:.4f}, range: {current_min_height:.3f} to {current_max_height:.3f})")
+                elif report_errors:
+                    self._log_info(f"dc {drive_current} not suitable for tap, {fth_rms} {htf_rms}")
+            else:
+                # Mapping failed - if we had acceptable ones before, this might mean we're going too high
+                if len(acceptable_dcs) > 0:
+                    if report_errors:
+                        self._log_msg(f"dc {drive_current}: calibration failed. Found {len(acceptable_dcs)} acceptable drive current(s) so far. Stopping search.")
+                    break
+            
+            drive_current += 1
+        
+        # Now select the best one from all acceptable drive currents
+        if len(acceptable_dcs) == 0:
+            if report_errors:
+                self._log_error(
+                    f"Failed to find tap drive current (tested {start_drive_current} to {end_drive_current}). "
+                    "Have you checked the sensor height?"
+                )
+            return None, None
+        
+        # Select the best drive current:
+        # Prefer lower min_height (better close-range detection), then lower error rate, then higher max_height
+        best_dc, best_mapping, best_min, best_max, best_error, best_spread = min(
+            acceptable_dcs,
+            key=lambda x: (x[2], x[4] if x[4] is not None else float('inf'), -x[3])  # (min_height, error, -max_height)
+        )
+        
+        self._log_msg(
+            f"Found {len(acceptable_dcs)} acceptable tap drive current(s). "
+            f"Selected best: {best_dc} (min: {best_min:.3f}, max: {best_max:.3f}, freq spread: {best_spread:.2f}%, error: {best_error:.4f})"
+        )
+        
+        # Store the mapping for this drive current
+        self._dc_to_fmap[best_dc] = best_mapping
+        return best_dc, best_mapping
+
+    def _calibrate_tap_drive_current(
+        self,
+        drive_current: int,
+        tap_start_z: float,
+        tap_target_z: float,
+        probe_speed: float,
+        lift_speed: float,
+        report_errors: bool = True,
+        write_debug_files: bool = False,
+    ) -> Tuple[Optional[ProbeEddyFrequencyMap], Optional[float], Optional[float]]:
+        """
+        Quickly calibrate a drive current for tap operations.
+        This only calibrates the tap range (tap_start_z to tap_target_z),
+        which is faster than a full calibration.
+        
+        Args:
+            drive_current: Drive current to calibrate (should already be validated as suitable for tap)
+            tap_start_z: Starting Z height for tap calibration
+            tap_target_z: Target Z height for tap calibration
+            probe_speed: Speed for probe movement
+            lift_speed: Speed for lift movement
+            report_errors: Whether to report errors during calibration
+            write_debug_files: Whether to write debug files during calibration
+            
+        Returns:
+            Tuple of (mapping, fth_fit, htf_fit) if successful, or (None, None, None) if failed
+        """
+        self._log_msg(f"Calibrating tap drive current {drive_current} for range {tap_start_z:.3f} to {tap_target_z:.3f}...")
+        
+        mapping, fth_fit, htf_fit = self._create_mapping(
+            tap_start_z,
+            tap_target_z,
+            probe_speed,
+            lift_speed,
+            drive_current,
+            report_errors=report_errors,
+            write_debug_files=write_debug_files,
+        )
+        
+        if mapping is not None:
+            self._log_msg(f"Tap calibration complete for drive current {drive_current}")
+            # Store the mapping for this drive current
+            self._dc_to_fmap[drive_current] = mapping
+        else:
+            if report_errors:
+                self._log_error(f"Tap calibration failed for drive current {drive_current}")
+        
+        return mapping, fth_fit, htf_fit
 
     def _create_mapping(
         self,
@@ -1780,12 +1975,8 @@ class ProbeEddy:
             gcmd = self._dummy_gcode_cmd
 
         orig_drive_current: int = self._sensor.get_drive_current()
-        tap_drive_current: int = gcmd.get_int(
-            name="DRIVE_CURRENT",
-            default=self._tap_drive_current,
-            minval=1,
-            maxval=31,
-        )
+        
+        # Get tap parameters
         tap_speed: float = gcmd.get_float("SPEED", self.params.tap_speed, above=0.0)
         lift_speed: float = gcmd.get_float("RETRACT_SPEED", self.params.lift_speed, above=0.0)
         tap_start_z: float = gcmd.get_float("START_Z", self.params.tap_start_z, above=2.0)
@@ -1799,7 +1990,7 @@ class ProbeEddy:
         samples_stddev = gcmd.get_float("SAMPLES_STDDEV", self.params.tap_samples_stddev, above=0.0)
         home_z: bool = gcmd.get_int("HOME_Z", 1) == 1
         write_plot_arg: int = gcmd.get_int("PLOT", None)
-
+        
         mode = gcmd.get("MODE", self.params.tap_mode).lower()
         if mode not in ("wma", "butter"):
             raise self._printer.command_error(f"Invalid mode: {mode}")
@@ -1815,6 +2006,39 @@ class ProbeEddy:
 
         if not self._z_homed():
             raise self._printer.command_error("Z axis must be homed before tapping")
+        
+        # Always find and calibrate tap drive current automatically
+        # This ensures it's optimal for the current temperature
+        # Use the same approach as reg_drive_current: start from sensor default and search upward
+        start_dc = self._sensor._default_drive_current
+        max_dc_increase = 5
+        if self._sensor_type == "ldc1612" or self._sensor_type == "btt_eddy" or self._sensor_type == "ldc1612_internal_clk":
+            max_dc_increase = 5
+        
+        # Use tap range for finding (faster than full calibration)
+        found_dc, found_mapping = self._find_tap_drive_current(
+            start_drive_current=start_dc,
+            max_dc_increase=max_dc_increase,
+            z_start=tap_start_z,
+            z_target=target_z,
+            probe_speed=tap_speed,
+            lift_speed=lift_speed,
+            report_errors=True,
+            write_debug_files=False,
+        )
+        
+        if found_dc is None or found_mapping is None:
+            raise self._printer.command_error(
+                "Failed to find suitable tap drive current. "
+                "You may need to adjust sensor height or try a different temperature."
+            )
+        
+        tap_drive_current = found_dc
+        self._tap_drive_current = found_dc
+        
+        # The mapping from _find_tap_drive_current is already created and stored in _dc_to_fmap
+        # No need to recalibrate - we already have the calibration for the tap range
+        self._log_debug(f"Using tap drive current {tap_drive_current} with calibration from tap range")
 
         write_tap_plot = self.params.write_tap_plot
         write_every_tap_plot = self.params.write_every_tap_plot and write_tap_plot
@@ -2360,6 +2584,8 @@ class ProbeEddyEndstopWrapper:
     def _handle_homing_move_begin(self, hmove):
         if self not in hmove.get_mcu_endstops():
             return
+        # Set drive current for homing (reg_drive_current) or tap (tap_drive_current)
+        self.eddy.reset_drive_current(tap=(self.tap_config is not None))
         self._sampler = self.eddy.start_sampler()
         self._homing_in_progress = True
         # if we're doing a tap, we're already in the right position;
@@ -2952,11 +3178,6 @@ class ProbeEddyFrequencyMap:
                 )
                 if not self._eddy.params.allow_unsafe:
                     return None, None
-
-            if min_height > 0.025:
-                self._eddy._log_msg(
-                    f"Drive current {drive_current} warning: min height is {min_height:.3f} (> 0.025) is too high for tap. This calibration will work fine for homing, but may not for tap."
-                )
 
             # somewhat arbitrary spread
             if freq_spread < 0.30:
