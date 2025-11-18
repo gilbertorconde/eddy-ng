@@ -440,6 +440,7 @@ class ProbeEddy:
         sensors = {
             "ldc1612": ldc1612_ng.LDC1612_ng,
             "btt_eddy": ldc1612_ng.LDC1612_ng,
+            "btt_eddy_coil": ldc1612_ng.LDC1612_ng,
             "cartographer": ldc1612_ng.LDC1612_ng,
             "mellow_fly": ldc1612_ng.LDC1612_ng,
             "ldc1612_internal_clk": ldc1612_ng.LDC1612_ng,
@@ -1235,7 +1236,7 @@ class ProbeEddy:
         )
 
         max_dc_increase = 0
-        if self._sensor_type == "ldc1612" or self._sensor_type == "btt_eddy" or self._sensor_type == "ldc1612_internal_clk":
+        if self._sensor_type in ("ldc1612", "btt_eddy", "btt_eddy_coil", "ldc1612_internal_clk"):
             max_dc_increase = 5
         max_dc_increase = gcmd.get_int("MAX_DC_INCREASE", max_dc_increase, minval=0, maxval=30)
 
@@ -2148,7 +2149,7 @@ class ProbeEddy:
         # Use the same approach as reg_drive_current: start from sensor default and search upward
         start_dc = self._sensor._default_drive_current
         max_dc_increase = 5
-        if self._sensor_type == "ldc1612" or self._sensor_type == "btt_eddy" or self._sensor_type == "ldc1612_internal_clk":
+        if self._sensor_type in ("ldc1612", "btt_eddy", "btt_eddy_coil", "ldc1612_internal_clk"):
             max_dc_increase = 5
         
         # Use tap range for finding (faster than full calibration)

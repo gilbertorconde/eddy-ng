@@ -71,6 +71,7 @@ enum {
 #define PRODUCT_STM32F0 2
 #define PRODUCT_MELLOW_FLY 3
 #define PRODUCT_LDC1612_INTERNAL_CLK 4
+#define PRODUCT_BTT_EDDY_COIL 5
 
 // Chip registers
 #define REG_DATA0_MSB 0x00
@@ -326,6 +327,9 @@ config_ldc1612_ng(uint32_t oid, uint32_t i2c_oid, uint8_t product, int32_t intb_
     case PRODUCT_UNKNOWN:
     case PRODUCT_BTT_EDDY:
         ld->sensor_cvt = 12000000.0f / (float)(1<<28);
+        break;
+    case PRODUCT_BTT_EDDY_COIL:
+        ld->sensor_cvt = 43400000.0f / (float)(1<<28);
         break;
     case PRODUCT_MELLOW_FLY:
         ld->sensor_cvt = 40000000.0f / (float)(1<<28);

@@ -53,6 +53,7 @@ PRODUCT_BTT_EDDY = 1
 PRODUCT_STM32F0 = 2
 PRODUCT_MELLOW_FLY = 3
 PRODUCT_LDC1612_INTERNAL_CLK = 4
+PRODUCT_BTT_EDDY_COIL = 5
 
 HOME_MODE_NONE = 0
 HOME_MODE_HOME = 1
@@ -86,6 +87,7 @@ class LDC1612_ng:
             "ldc1612": PRODUCT_UNKNOWN,
             "btt_eddy": PRODUCT_BTT_EDDY,
             "cartographer": PRODUCT_STM32F0,
+            "btt_eddy_coil": PRODUCT_BTT_EDDY_COIL,
             "mellow_fly": PRODUCT_MELLOW_FLY,
             "ldc1612_internal_clk": PRODUCT_LDC1612_INTERNAL_CLK,
         }
@@ -113,7 +115,7 @@ class LDC1612_ng:
             self._ldc_fref_divider = 1
             self._ldc_settle_time = 0.00125
             self._default_drive_current = 15
-        else:  # Generic/BTT Eddy using external 12MHz clock source
+        else:  # Generic/BTT Eddy variants using external 12MHz clock source
             self._ldc_freq_clk = 12_000_000
             self._ldc_settle_time = 0.005
             self._ldc_fin_divider = 1
